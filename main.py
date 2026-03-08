@@ -25,8 +25,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ─────────────────────────────────────────
 # SOZLAMALAR — barchasi shu yerda
 # ─────────────────────────────────────────
-TOKEN     = "8442363419:AAHln5Er1KVf2YATURL9aoFMaESR1D5zGAI"
-ADMIN_IDS = [123456789]   # ← o'z Telegram ID ingizni yozing
+TOKEN     = "8442363419:AAFkWt3a77-QISXcbNTATPWyCohRUAeUgj4"
+ADMIN_IDS = [7693087447]   # ← o'z Telegram ID ingizni yozing
 
 TALABA_JSON  = "talaba.json"
 USTOZ_JSON   = "ustoz.json"
