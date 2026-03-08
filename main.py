@@ -11,7 +11,7 @@ from playwright.async_api import async_playwright
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
 
-# ─────────────────────────────────────────
+# ────────────────────────────────────────
 # LOGS
 # ─────────────────────────────────────────
 logging.basicConfig(
