@@ -2,6 +2,7 @@ import json, asyncio, os, logging, warnings, time, re, sqlite3
 from datetime import datetime
 from typing import Optional
 import pytz
+import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -474,16 +475,17 @@ def parse_svg_html_today(html: str, today_weekday: int) -> list:
         except: continue
     return [p for p in range(1, 9) if p not in occupied]
 
-async def _scan_page(sem, page, room_name: str, url: str, today_weekday: int) -> tuple:
+async def _fetch_room_html(session: aiohttp.ClientSession, sem: asyncio.Semaphore,
+                           room_name: str, url: str, today_weekday: int) -> tuple:
     async with sem:
         try:
-            await page.goto(url, wait_until="networkidle", timeout=45000)
-            html = await page.content()
-            free_paras = parse_svg_html_today(html, today_weekday)
-            return room_name, free_paras
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                html = await resp.text()
+                free_paras = parse_svg_html_today(html, today_weekday)
+                return room_name, free_paras
         except Exception as e:
-            log.error(f"Scan [{room_name}]: {e}")
-            return room_name, list(range(1, 9))
+            log.error(f"Fetch [{room_name}]: {e}")
+            return room_name, []  # xato bo'lsa bo'sh deb hisoblamaymiz
 
 async def job_scan_free_rooms():
     log.info("Bosh xona skanerlash boshlandi...")
@@ -491,34 +493,68 @@ async def job_scan_free_rooms():
     if not xonalar:
         log.warning("xonalar.json bo'sh"); return
     now = datetime.now(TASHKENT_TZ)
-    today_weekday = now.weekday()  # 0=Dushanba ... 5=Shanba
-    # Yakshanba (6) da skanerlash shart emas
+    today_weekday = now.weekday()
     if today_weekday == 6:
         log.info("Yakshanba — skanerlash o'tkazib yuborildi"); return
-    PARALLEL = 4  # tezroq ishlash uchun
+
+    PARALLEL = 3        # bir vaqtda 3 ta so'rov — saytni ortiqcha yuklamaymiz
+    DELAY    = 1.0      # har so'rovdan keyin 1 soniya kutamiz
+    BATCH    = 15       # 15 tadan batch, batch orasida 3 soniya dam
+
     free_data = {}
     items = list(xonalar.items())
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "uz-UZ,uz;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True, args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
-            )
-            sem   = asyncio.Semaphore(PARALLEL)
-            pages = [await browser.new_page(viewport={"width": 800, "height": 600}) for _ in range(PARALLEL)]
-            BATCH = 20
-            for batch_start in range(0, len(items), BATCH):
-                batch   = items[batch_start:batch_start + BATCH]
-                tasks   = [_scan_page(sem, pages[i % PARALLEL], rn, url, today_weekday)
-                           for i, (rn, url) in enumerate(batch)]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for res in results:
-                    if isinstance(res, tuple): free_data[res[0]] = res[1]
-                log.info(f"Skanerlash: {batch_start+len(batch)}/{len(items)}")
-                await asyncio.sleep(0.5)
-            for pg in pages: await pg.close()
-            await browser.close()
+        connector = aiohttp.TCPConnector(limit=PARALLEL, ssl=False, ttl_dns_cache=300)
+        async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
+            sem = asyncio.Semaphore(PARALLEL)
+            total = len(items)
+            ok_count = 0
+
+            for batch_start in range(0, total, BATCH):
+                batch = items[batch_start:batch_start + BATCH]
+
+                for room_name, url in batch:
+                    async with sem:
+                        try:
+                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                                if resp.status == 429:
+                                    log.warning(f"Rate limit! 30 soniya kutamiz...")
+                                    await asyncio.sleep(30)
+                                    # qayta urinish
+                                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp2:
+                                        html = await resp2.text()
+                                elif resp.status == 200:
+                                    html = await resp.text()
+                                else:
+                                    log.warning(f"[{room_name}] HTTP {resp.status}")
+                                    free_data[room_name] = []
+                                    continue
+                                free_paras = parse_svg_html_today(html, today_weekday)
+                                free_data[room_name] = free_paras
+                                ok_count += 1
+                        except asyncio.TimeoutError:
+                            log.warning(f"[{room_name}] Timeout — o'tkazib yuborildi")
+                            free_data[room_name] = []
+                        except Exception as e:
+                            log.error(f"[{room_name}] Xato: {e}")
+                            free_data[room_name] = []
+                        await asyncio.sleep(DELAY)  # har so'rovdan keyin pauza
+
+                done = min(batch_start + BATCH, total)
+                log.info(f"Skanerlash: {done}/{total} ({ok_count} muvaffaqiyatli)")
+                await asyncio.sleep(3)  # har batch orasida 3 soniya dam
+
     except Exception as e:
-        log.error(f"Scan error: {e}")
+        log.error(f"Scan session error: {e}")
+
+    db_save_free_rooms(free_data)
+    log.info(f"Skanerlash tugadi ✅ {len(free_data)} xona | {DAYS_UZ[today_weekday]}")
     db_save_free_rooms(free_data)
     log.info(f"Skanerlash tugadi: {len(free_data)} xona ({DAYS_UZ[today_weekday]})")
 
