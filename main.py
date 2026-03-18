@@ -1154,5 +1154,17 @@ async def main():
     log.info("Bot polling boshlandi ✅")
     await dp.start_polling(bot)
 
+@dp.message(Command("getdb"))
+async def cmd_getdb(message: types.Message):
+    if not is_admin(message.from_user.id): return
+    try:
+        await message.answer_document(
+            types.FSInputFile(DB_FILE),
+            caption="✅ bot.db fayli"
+        )
+    except Exception as e:
+        await message.answer(f"❌ Xatolik: {e}")
+
+
 if __name__ == "__main__":
     asyncio.run(main())
