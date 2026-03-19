@@ -1165,7 +1165,6 @@ async def cb_adm_stats(callback: types.CallbackQuery):
         today = datetime.now(TASHKENT_TZ).strftime("%d.%m.%Y")
         cur.execute("SELECT COUNT(*) FROM logs WHERE vaqt LIKE ?", (f"{today}%",))
         today_logs = cur.fetchone()[0]
-        con.close()
         @dp.message(Command("uploaddb"))
 async def cmd_uploaddb(message: types.Message):
     if not is_admin(message.from_user.id): return
@@ -1188,7 +1187,7 @@ async def cmd_uploaddb(message: types.Message):
     except Exception as e:
         await message.answer(f"❌ Xatolik: {e}")
         
-        
+        con.close()
         text = (
             f"📊 *Statistika*\n\n"
             f"👥 Foydalanuvchilar: *{total_users}*\n"
