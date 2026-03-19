@@ -1166,6 +1166,29 @@ async def cb_adm_stats(callback: types.CallbackQuery):
         cur.execute("SELECT COUNT(*) FROM logs WHERE vaqt LIKE ?", (f"{today}%",))
         today_logs = cur.fetchone()[0]
         con.close()
+        @dp.message(Command("uploaddb"))
+async def cmd_uploaddb(message: types.Message):
+    if not is_admin(message.from_user.id): return
+    if not message.document:
+        await message.answer("⚠️ Iltimos, .db faylni /uploaddb bilan birga yuboring\n\nMisol: faylni tanlang → caption ga /uploaddb yozing")
+        return
+    if not message.document.file_name.endswith(".db"):
+        await message.answer("❌ Faqat .db fayl yuborilishi kerak!")
+        return
+    try:
+        # Eski faylni zaxiralash
+        import shutil
+        if os.path.exists(DB_FILE):
+            shutil.copy(DB_FILE, DB_FILE + ".backup")
+        
+        # Yangi faylni yuklash
+        file = await bot.get_file(message.document.file_id)
+        await bot.download_file(file.file_path, DB_FILE)
+        await message.answer("✅ bot.db muvaffaqiyatli yangilandi!\n\n💾 Eski fayl .backup sifatida saqlandi.")
+    except Exception as e:
+        await message.answer(f"❌ Xatolik: {e}")
+        
+        
         text = (
             f"📊 *Statistika*\n\n"
             f"👥 Foydalanuvchilar: *{total_users}*\n"
