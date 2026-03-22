@@ -2,6 +2,7 @@ import json, asyncio, os, logging, warnings, time, re, sqlite3
 from datetime import datetime
 from typing import Optional
 import pytz
+import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -58,8 +59,8 @@ BOT_START_TIME = datetime.now(TASHKENT_TZ)
 class TeacherFlow(StatesGroup):
     search = State()
 
-class FreeRoomFlow(StatesGroup):
-    time_input = State()
+class FreeRoomFlow_OLD:
+    pass
 
 class AutoSchedule(StatesGroup):
     day  = State()
@@ -223,12 +224,11 @@ def db_save_free_rooms(free_data: dict):
         con = get_db(); cur = con.cursor()
         cur.execute("DELETE FROM free_rooms WHERE sana=?", (today,))
         rows = []
-        for room, days in free_data.items():
+        for room, free_paras in free_data.items():
             bino = room.split("-")[0].split("/")[0].strip()
-            for day_idx, paras in days.items():
-                for para in paras:
-                    s, e = PARA_TIMES[para]
-                    rows.append((today, room, bino, f"{s}-{e}", para))
+            for para in free_paras:
+                s, e = PARA_TIMES[para]
+                rows.append((today, room, bino, f"{s}-{e}", para))
         cur.executemany("INSERT INTO free_rooms (sana,xona,bino,vaqt_oralig,para) VALUES (?,?,?,?,?)", rows)
         con.commit(); con.close()
         log.info(f"Bosh xonalar saqlandi: {len(rows)} yozuv")
@@ -452,11 +452,12 @@ DAY_X  = [55, 145, 235, 325, 415, 505]
 PARA_Y = [250, 414, 578, 742, 906, 1070, 1234, 1398]
 COL_W, ROW_H = 90, 164
 
-def parse_svg_html(html: str) -> dict:
-    result = {i: list(range(1, 9)) for i in range(6)}
+def parse_svg_html_today(html: str, today_weekday: int) -> list:
+    """Faqat bugungi kun uchun bo'sh paralar ro'yxatini qaytaradi"""
+    all_free = list(range(1, 9))  # default: hammasi bo'sh
     soup = BeautifulSoup(html, "html.parser")
     svg  = soup.find("g", {"id": "PRINT_SCENE_BG_1"})
-    if not svg: return result
+    if not svg: return all_free
     occupied = set()
     for rect in svg.find_all("rect"):
         try:
@@ -466,55 +467,96 @@ def parse_svg_html(html: str) -> dict:
             if fill in ["transparent", "none", ""] or w < 50 or h < 50: continue
             for di, dx in enumerate(DAY_X):
                 if abs(x - dx) < COL_W * 0.6:
-                    for pi, py in enumerate(PARA_Y):
-                        if abs(y - py) < ROW_H * 0.6:
-                            occupied.add((di, pi + 1)); break
+                    if di == today_weekday:
+                        for pi, py in enumerate(PARA_Y):
+                            if abs(y - py) < ROW_H * 0.6:
+                                occupied.add(pi + 1); break
                     break
         except: continue
-    for di in range(6):
-        result[di] = [p for p in range(1, 9) if (di, p) not in occupied]
-    return result
+    return [p for p in range(1, 9) if p not in occupied]
 
-async def _scan_page(sem, page, room_name: str, url: str) -> tuple:
+async def _fetch_room_html(session: aiohttp.ClientSession, sem: asyncio.Semaphore,
+                           room_name: str, url: str, today_weekday: int) -> tuple:
     async with sem:
         try:
-            await page.goto(url, wait_until="networkidle", timeout=45000)
-            html = await page.content()
-            return room_name, parse_svg_html(html)
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                html = await resp.text()
+                free_paras = parse_svg_html_today(html, today_weekday)
+                return room_name, free_paras
         except Exception as e:
-            log.error(f"Scan [{room_name}]: {e}")
-            return room_name, {i: list(range(1, 9)) for i in range(6)}
+            log.error(f"Fetch [{room_name}]: {e}")
+            return room_name, []  # xato bo'lsa bo'sh deb hisoblamaymiz
 
 async def job_scan_free_rooms():
     log.info("Bosh xona skanerlash boshlandi...")
     xonalar = load_json(XONALAR_JSON)
     if not xonalar:
         log.warning("xonalar.json bo'sh"); return
-    PARALLEL = 2
+    now = datetime.now(TASHKENT_TZ)
+    today_weekday = now.weekday()
+    if today_weekday == 6:
+        log.info("Yakshanba — skanerlash o'tkazib yuborildi"); return
+
+    PARALLEL = 3        # bir vaqtda 3 ta so'rov — saytni ortiqcha yuklamaymiz
+    DELAY    = 1.0      # har so'rovdan keyin 1 soniya kutamiz
+    BATCH    = 15       # 15 tadan batch, batch orasida 3 soniya dam
+
     free_data = {}
     items = list(xonalar.items())
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "uz-UZ,uz;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True, args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
-            )
-            sem   = asyncio.Semaphore(PARALLEL)
-            pages = [await browser.new_page(viewport={"width": 800, "height": 600}) for _ in range(PARALLEL)]
-            BATCH = 20
-            for batch_start in range(0, len(items), BATCH):
-                batch   = items[batch_start:batch_start + BATCH]
-                tasks   = [_scan_page(sem, pages[i % PARALLEL], rn, url) for i, (rn, url) in enumerate(batch)]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for res in results:
-                    if isinstance(res, tuple): free_data[res[0]] = res[1]
-                log.info(f"Skanerlash: {batch_start+len(batch)}/{len(items)}")
-                await asyncio.sleep(1)
-            for pg in pages: await pg.close()
-            await browser.close()
+        connector = aiohttp.TCPConnector(limit=PARALLEL, ssl=False, ttl_dns_cache=300)
+        async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
+            sem = asyncio.Semaphore(PARALLEL)
+            total = len(items)
+            ok_count = 0
+
+            for batch_start in range(0, total, BATCH):
+                batch = items[batch_start:batch_start + BATCH]
+
+                for room_name, url in batch:
+                    async with sem:
+                        try:
+                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                                if resp.status == 429:
+                                    log.warning(f"Rate limit! 30 soniya kutamiz...")
+                                    await asyncio.sleep(30)
+                                    # qayta urinish
+                                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp2:
+                                        html = await resp2.text()
+                                elif resp.status == 200:
+                                    html = await resp.text()
+                                else:
+                                    log.warning(f"[{room_name}] HTTP {resp.status}")
+                                    free_data[room_name] = []
+                                    continue
+                                free_paras = parse_svg_html_today(html, today_weekday)
+                                free_data[room_name] = free_paras
+                                ok_count += 1
+                        except asyncio.TimeoutError:
+                            log.warning(f"[{room_name}] Timeout — o'tkazib yuborildi")
+                            free_data[room_name] = []
+                        except Exception as e:
+                            log.error(f"[{room_name}] Xato: {e}")
+                            free_data[room_name] = []
+                        await asyncio.sleep(DELAY)  # har so'rovdan keyin pauza
+
+                done = min(batch_start + BATCH, total)
+                log.info(f"Skanerlash: {done}/{total} ({ok_count} muvaffaqiyatli)")
+                await asyncio.sleep(3)  # har batch orasida 3 soniya dam
+
     except Exception as e:
-        log.error(f"Scan error: {e}")
+        log.error(f"Scan session error: {e}")
+
     db_save_free_rooms(free_data)
-    log.info(f"Skanerlash tugadi: {len(free_data)} xona")
+    log.info(f"Skanerlash tugadi ✅ {len(free_data)} xona | {DAYS_UZ[today_weekday]}")
+    db_save_free_rooms(free_data)
+    log.info(f"Skanerlash tugadi: {len(free_data)} xona ({DAYS_UZ[today_weekday]})")
 
 # ─────────────────────────────────────────
 # AVTO JADVAL
@@ -793,34 +835,111 @@ async def cb_room_select(callback: types.CallbackQuery):
     await send_schedule(chat_id, url, room_name, callback.from_user, tur="xona")
 
 # ─── BOSH XONA ───
+class FreeRoomFlow(StatesGroup):
+    bino_select = State()
+    time_input  = State()
+
 @dp.callback_query(F.data == "menu_free")
 async def cb_free_rooms(callback: types.CallbackQuery, state: FSMContext):
     chat_id = callback.message.chat.id
-    await state.set_state(FreeRoomFlow.time_input)
+    await state.clear()
+    # DB da bugun uchun ma'lumot bormi tekshiramiz
+    today = datetime.now(TASHKENT_TZ).strftime("%d.%m.%Y")
+    con = get_db(); cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM free_rooms WHERE sana=?", (today,))
+    count = cur.fetchone()[0]
+    con.close()
+    if count == 0:
+        kb = InlineKeyboardBuilder()
+        kb.row(types.InlineKeyboardButton(text=tr("menu_btn", chat_id), callback_data="go_menu"))
+        lg = lang(chat_id)
+        msg = ("😔 Bugungi bosh xonalar hali skanerlenmagan.\n\n💡 Admin /scan_rooms bilan yangilay oladi."
+               if lg == "uz" else
+               "😔 Свободные кабинеты ещё не сканированы.\n\n💡 Администратор может обновить командой /scan_rooms.")
+        await callback.message.edit_text(msg, reply_markup=kb.as_markup())
+        return
+    # Binolar ro'yxatini chiqaramiz
+    cur = get_db().cursor()
+    con2 = get_db(); cur2 = con2.cursor()
+    cur2.execute("SELECT DISTINCT bino FROM free_rooms WHERE sana=? ORDER BY bino", (today,))
+    binolar = [r[0] for r in cur2.fetchall()]
+    con2.close()
+    binolar_sorted = sorted(binolar, key=lambda x: (int(x) if x.isdigit() else 999, x))
+    _bino_cache[f"free_{chat_id}"] = {str(i): b for i, b in enumerate(binolar_sorted)}
     kb = InlineKeyboardBuilder()
-    for para, (s, e) in PARA_TIMES.items():
+    lg = lang(chat_id)
+    title = "🏢 Qaysi binoda bosh xona izlaysiz?" if lg == "uz" else "🏢 В каком корпусе ищете свободный кабинет?"
+    for i, bino in enumerate(binolar_sorted):
+        kb.add(types.InlineKeyboardButton(text=f"🏢 {bino}-bino", callback_data=f"freebino_{i}"))
+    kb.adjust(3)
+    kb.row(types.InlineKeyboardButton(text=tr("back", chat_id), callback_data="go_menu"))
+    await state.set_state(FreeRoomFlow.bino_select)
+    await callback.message.edit_text(title, reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data.startswith("freebino_"))
+async def cb_freebino(callback: types.CallbackQuery, state: FSMContext):
+    chat_id = callback.message.chat.id
+    idx = callback.data.split("_")[1]
+    bino = (_bino_cache.get(f"free_{chat_id}") or {}).get(idx)
+    if not bino:
+        await callback.answer("Qayta urinib ko'ring!", show_alert=True); return
+    await state.update_data(bino=bino)
+    # Bu bino uchun bugun bo'sh paralar
+    today = datetime.now(TASHKENT_TZ).strftime("%d.%m.%Y")
+    con = get_db(); cur = con.cursor()
+    cur.execute("SELECT DISTINCT para FROM free_rooms WHERE sana=? AND bino=? ORDER BY para", (today, bino))
+    free_paras = [r[0] for r in cur.fetchall()]
+    con.close()
+    if not free_paras:
+        kb = InlineKeyboardBuilder()
+        kb.row(types.InlineKeyboardButton(text=tr("back", chat_id), callback_data="menu_free"))
+        lg = lang(chat_id)
+        msg = f"😔 *{bino}-bino*da bugun bosh xona yo'q." if lg == "uz" else f"😔 В *{bino}-корпусе* сегодня нет свободных кабинетов."
+        await callback.message.edit_text(msg, reply_markup=kb.as_markup(), parse_mode="Markdown")
+        return
+    kb = InlineKeyboardBuilder()
+    for para in free_paras:
+        s, e = PARA_TIMES[para]
         kb.add(types.InlineKeyboardButton(text=f"{para}️⃣ {s}-{e}", callback_data=f"freetime_{s}-{e}"))
     kb.adjust(2)
-    kb.row(types.InlineKeyboardButton(text=tr("back", chat_id), callback_data="go_menu"))
-    await callback.message.edit_text(tr("free_ask", chat_id), reply_markup=kb.as_markup())
+    kb.row(types.InlineKeyboardButton(text=tr("back", chat_id), callback_data="menu_free"))
+    lg = lang(chat_id)
+    title = (f"🏢 *{bino}-bino* — qaysi paraga bosh xona kerak?\n\nBugun bo'sh paralar:"
+             if lg == "uz" else
+             f"🏢 *{bino}-корпус* — на какую пару нужен свободный кабинет?\n\nСвободные пары сегодня:")
+    await state.set_state(FreeRoomFlow.time_input)
+    await callback.message.edit_text(title, reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("freetime_"))
 async def cb_freetime_btn(callback: types.CallbackQuery, state: FSMContext):
-    await _handle_free(callback.message, state, callback.data[9:], callback.from_user)
+    data = await state.get_data()
+    bino = data.get("bino")
+    await _handle_free(callback.message, state, callback.data[9:], callback.from_user, bino)
 
 @dp.message(FreeRoomFlow.time_input)
 async def msg_free_time(message: types.Message, state: FSMContext):
     raw = message.text.strip()
     if re.match(r'^([01]?\d|2[0-3]):[0-5]\d-([01]?\d|2[0-3]):[0-5]\d$', raw):
-        await _handle_free(message, state, raw, message.from_user)
+        data = await state.get_data()
+        bino = data.get("bino")
+        await _handle_free(message, state, raw, message.from_user, bino)
     else:
         await message.answer(tr("free_invalid", message.chat.id))
 
-async def _handle_free(message, state: FSMContext, time_str: str, user: types.User):
+async def _handle_free(message, state: FSMContext, time_str: str, user: types.User, bino: str = None):
     chat_id = message.chat.id
     await state.clear()
-    rooms = db_get_free_rooms(time_str)
-    kb    = InlineKeyboardBuilder()
+    today = datetime.now(TASHKENT_TZ).strftime("%d.%m.%Y")
+    con = get_db(); cur = con.cursor()
+    if bino:
+        cur.execute("SELECT xona,bino,para FROM free_rooms WHERE sana=? AND vaqt_oralig=? AND bino=?",
+                    (today, time_str, bino))
+    else:
+        cur.execute("SELECT xona,bino,para FROM free_rooms WHERE sana=? AND vaqt_oralig=?",
+                    (today, time_str))
+    rooms = cur.fetchall()
+    con.close()
+    kb = InlineKeyboardBuilder()
     if not rooms:
         kb.row(types.InlineKeyboardButton(text=tr("back", chat_id), callback_data="menu_free"))
         kb.row(types.InlineKeyboardButton(text=tr("menu_btn", chat_id), callback_data="go_menu"))
@@ -829,14 +948,14 @@ async def _handle_free(message, state: FSMContext, time_str: str, user: types.Us
         return
     xonalar = load_json(XONALAR_JSON)
     binolar: dict = {}
-    for room_name, bino, para in rooms:
-        binolar.setdefault(bino, []).append(room_name)
+    for room_name, b, para in rooms:
+        binolar.setdefault(b, []).append(room_name)
     text = tr("free_title", chat_id, time=time_str)
     _room_cache[chat_id] = {}
     idx = 0
-    for bino in sorted(binolar, key=lambda x: (int(x) if x.isdigit() else 999, x)):
-        text += f"🏢 *{bino}-bino:*\n"
-        for room in sorted(binolar[bino]):
+    for b in sorted(binolar, key=lambda x: (int(x) if x.isdigit() else 999, x)):
+        text += f"🏢 *{b}-bino:*\n"
+        for room in sorted(binolar[b]):
             text += f"  🚪 {room}\n"
             if xonalar.get(room):
                 _room_cache[chat_id][str(idx)] = (room, xonalar[room])
@@ -848,7 +967,7 @@ async def _handle_free(message, state: FSMContext, time_str: str, user: types.Us
     kb.row(types.InlineKeyboardButton(text=tr("menu_btn", chat_id), callback_data="go_menu"))
     try: await message.edit_text(text[:4096], reply_markup=kb.as_markup(), parse_mode="Markdown")
     except: await message.answer(text[:4096], reply_markup=kb.as_markup(), parse_mode="Markdown")
-    db_add_log(user.id, "free_rooms_search", time_str)
+    db_add_log(user.id, "free_rooms_search", f"{bino or 'all'}|{time_str}")
 
 # ─── SAQLASH ───
 @dp.callback_query(F.data == "dosave_prompt")
@@ -987,16 +1106,8 @@ async def broadcast_receive(message: types.Message, state: FSMContext):
     ok, fail = 0, 0
     for uid in user_ids:
         try:
-            if message.photo:
-                await bot.send_photo(uid, message.photo[-1].file_id, caption=message.caption or "")
-            elif message.video:
-                await bot.send_video(uid, message.video.file_id, caption=message.caption or "")
-            elif message.document:
-                await bot.send_document(uid, message.document.file_id, caption=message.caption or "")
-            elif message.text:
-                await bot.send_message(uid, message.text, parse_mode="Markdown")
-            else:
-                await bot.copy_message(uid, message.chat.id, message.message_id)
+            # copy_message — format, emoji, username larni o'zgartirmaydi
+            await bot.copy_message(uid, message.chat.id, message.message_id)
             ok += 1
         except:
             fail += 1
@@ -1126,19 +1237,47 @@ async def cb_adm_broadcast(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "adm_scan")
 async def cb_adm_scan(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id): return
-    await callback.message.edit_text("⏳ Xonalar skanerlash boshlandi...\nBir necha daqiqa olishi mumkin.")
+    now = datetime.now(TASHKENT_TZ)
+    if now.weekday() == 6:
+        kb = InlineKeyboardBuilder()
+        kb.row(types.InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_menu"))
+        await callback.message.edit_text("⚠️ Bugun Yakshanba — dars yo'q, skanerlash shart emas.", reply_markup=kb.as_markup())
+        return
+    await callback.message.edit_text(f"⏳ Skanerlash boshlandi...\n📅 Bugun: {DAYS_UZ[now.weekday()]}\nBir necha daqiqa olishi mumkin.")
     await job_scan_free_rooms()
+    today = now.strftime("%d.%m.%Y")
+    con = get_db(); cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM free_rooms WHERE sana=?", (today,))
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(DISTINCT xona) FROM free_rooms WHERE sana=?", (today,))
+    xona_count = cur.fetchone()[0]
+    con.close()
     kb = InlineKeyboardBuilder()
+    kb.row(types.InlineKeyboardButton(text="🔄 Qayta skaner", callback_data="adm_scan"))
     kb.row(types.InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_menu"))
-    await callback.message.edit_text("✅ Skanerlash tugadi!", reply_markup=kb.as_markup())
+    await callback.message.edit_text(
+        f"✅ *Skanerlash tugadi!*\n\n"
+        f"📅 Kun: *{DAYS_UZ[now.weekday()]}*\n"
+        f"🚪 Bosh xonalar: *{xona_count}* ta\n"
+        f"📋 Jami yozuvlar: *{total}* ta",
+        reply_markup=kb.as_markup(), parse_mode="Markdown"
+    )
 
 @dp.message(Command("scan_rooms"))
 async def cmd_scan_rooms(message: types.Message):
     if not is_admin(message.from_user.id): return
-    await message.answer("⏳ Skanerlash boshlandi...")
+    now = datetime.now(TASHKENT_TZ)
+    if now.weekday() == 6:
+        await message.answer("⚠️ Bugun Yakshanba — dars yo'q, skanerlash shart emas.")
+        return
+    status = await message.answer(f"⏳ Skanerlash boshlandi...\n📅 Bugun: {DAYS_UZ[now.weekday()]}")
     await job_scan_free_rooms()
-    count = len(load_json(XONALAR_JSON))
-    await message.answer(tr("free_updated", message.chat.id, count=count))
+    today = now.strftime("%d.%m.%Y")
+    con = get_db(); cur = con.cursor()
+    cur.execute("SELECT COUNT(DISTINCT xona) FROM free_rooms WHERE sana=?", (today,))
+    xona_count = cur.fetchone()[0]
+    con.close()
+    await status.edit_text(f"✅ Skanerlash tugadi!\n🚪 Bosh xonalar: *{xona_count}* ta", parse_mode="Markdown")
 
 # ═══════════════════════════════════════════
 # M A I N
@@ -1147,7 +1286,7 @@ async def main():
     log.info("Bot ishga tushmoqda...")
     init_db()
     restore_auto_schedules()
-    scheduler.add_job(job_scan_free_rooms, "cron", hour=5, minute=30, id="scan_rooms")
+    scheduler.add_job(job_scan_free_rooms, "cron", hour="5,6,7,8", minute=0, id="scan_rooms")
     if not scheduler.running:
         scheduler.start()
     await bot.delete_webhook(drop_pending_updates=True)
@@ -1165,24 +1304,6 @@ async def cmd_getdb(message: types.Message):
     except Exception as e:
         await message.answer(f"❌ Xatolik: {e}")
 
-@dp.message(Command("uploaddb"))
-async def cmd_uploaddb(message: types.Message):
-    if not is_admin(message.from_user.id): return
-    if not message.document:
-        await message.answer("⚠️ Iltimos, .db faylni /uploaddb caption bilan yuboring")
-        return
-    if not message.document.file_name.endswith(".db"):
-        await message.answer("❌ Faqat .db fayl yuborilishi kerak!")
-        return
-    try:
-        import shutil
-        if os.path.exists(DB_FILE):
-            shutil.copy(DB_FILE, DB_FILE + ".backup")
-        file = await bot.get_file(message.document.file_id)
-        await bot.download_file(file.file_path, DB_FILE)
-        await message.answer("✅ bot.db muvaffaqiyatli yangilandi!\n\n💾 Eski fayl .backup sifatida saqlandi.")
-    except Exception as e:
-        await message.answer(f"❌ Xatolik: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
